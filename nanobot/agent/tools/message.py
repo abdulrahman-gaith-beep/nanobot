@@ -1,16 +1,17 @@
 """Message tool for sending messages to users."""
 
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool
 from nanobot.bus.events import OutboundMessage
+from nanobot.runtime.tool_context import get_tool_context
 
 
 class MessageTool(Tool):
     """Tool to send messages to users on chat channels."""
-    
+
     def __init__(
-        self, 
+        self,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
         default_channel: str = "",
         default_chat_id: str = ""
@@ -18,24 +19,24 @@ class MessageTool(Tool):
         self._send_callback = send_callback
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
-    
+
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set the current message context."""
         self._default_channel = channel
         self._default_chat_id = chat_id
-    
+
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
         self._send_callback = callback
-    
+
     @property
     def name(self) -> str:
         return "message"
-    
+
     @property
     def description(self) -> str:
         return "Send a message to the user. Use this when you want to communicate something."
-    
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
@@ -53,6 +54,14 @@ class MessageTool(Tool):
                     "type": "string",
                     "description": "Optional: target chat/user ID"
                 },
+                "reply_to": {
+                    "type": "string",
+                    "description": "Optional: message ID to reply to"
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "Optional: thread handle for threaded channels"
+                },
                 "media": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -61,31 +70,41 @@ class MessageTool(Tool):
             },
             "required": ["content"]
         }
-    
+
     async def execute(
-        self, 
-        content: str, 
-        channel: str | None = None, 
+        self,
+        content: str,
+        channel: str | None = None,
         chat_id: str | None = None,
+        reply_to: str | None = None,
+        thread_id: str | None = None,
         media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
-        channel = channel or self._default_channel
-        chat_id = chat_id or self._default_chat_id
-        
+        ctx = get_tool_context()
+        default_target = ctx.reply_target if ctx else None
+
+        channel = channel or self._default_channel or (default_target.channel if default_target else "")
+        chat_id = chat_id or self._default_chat_id or (default_target.chat_id if default_target else "")
+        reply_to = reply_to or (default_target.reply_to if default_target else None)
+        thread_id = thread_id or (default_target.thread_id if default_target else None)
+
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
-        
+
         if not self._send_callback:
             return "Error: Message sending not configured"
-        
+
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
-            media=media or []
+            reply_to=reply_to,
+            thread_id=thread_id,
+            media=media or [],
+            metadata=dict(default_target.metadata) if default_target else {},
         )
-        
+
         try:
             await self._send_callback(msg)
             media_info = f" with {len(media)} attachments" if media else ""

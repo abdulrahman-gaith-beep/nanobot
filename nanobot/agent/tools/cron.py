@@ -5,29 +5,30 @@ from typing import Any
 from nanobot.agent.tools.base import Tool
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronSchedule
+from nanobot.runtime.tool_context import get_tool_context
 
 
 class CronTool(Tool):
     """Tool to schedule reminders and recurring tasks."""
-    
+
     def __init__(self, cron_service: CronService):
         self._cron = cron_service
         self._channel = ""
         self._chat_id = ""
-    
+
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set the current session context for delivery."""
         self._channel = channel
         self._chat_id = chat_id
-    
+
     @property
     def name(self) -> str:
         return "cron"
-    
+
     @property
     def description(self) -> str:
         return "Schedule reminders and recurring tasks. Actions: add, list, remove."
-    
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
@@ -65,7 +66,7 @@ class CronTool(Tool):
             },
             "required": ["action"]
         }
-    
+
     async def execute(
         self,
         action: str,
@@ -84,7 +85,7 @@ class CronTool(Tool):
         elif action == "remove":
             return self._remove_job(job_id)
         return f"Unknown action: {action}"
-    
+
     def _add_job(
         self,
         message: str,
@@ -95,7 +96,13 @@ class CronTool(Tool):
     ) -> str:
         if not message:
             return "Error: message is required for add"
-        if not self._channel or not self._chat_id:
+        ctx = get_tool_context()
+        channel = self._channel
+        chat_id = self._chat_id
+        if ctx:
+            channel = ctx.reply_target.channel
+            chat_id = ctx.reply_target.chat_id
+        if not channel or not chat_id:
             return "Error: no session context (channel/chat_id)"
         if tz and not cron_expr:
             return "Error: tz can only be used with cron_expr"
@@ -105,7 +112,7 @@ class CronTool(Tool):
                 ZoneInfo(tz)
             except (KeyError, Exception):
                 return f"Error: unknown timezone '{tz}'"
-        
+
         # Build schedule
         delete_after = False
         if every_seconds:
@@ -120,25 +127,25 @@ class CronTool(Tool):
             delete_after = True
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
-        
+
         job = self._cron.add_job(
             name=message[:30],
             schedule=schedule,
             message=message,
             deliver=True,
-            channel=self._channel,
-            to=self._chat_id,
+            channel=channel,
+            to=chat_id,
             delete_after_run=delete_after,
         )
         return f"Created job '{job.name}' (id: {job.id})"
-    
+
     def _list_jobs(self) -> str:
         jobs = self._cron.list_jobs()
         if not jobs:
             return "No scheduled jobs."
         lines = [f"- {j.name} (id: {j.id}, {j.schedule.kind})" for j in jobs]
         return "Scheduled jobs:\n" + "\n".join(lines)
-    
+
     def _remove_job(self, job_id: str | None) -> str:
         if not job_id:
             return "Error: job_id is required for remove"

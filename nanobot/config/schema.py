@@ -1,7 +1,8 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
+
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -292,7 +293,7 @@ class Config(BaseSettings):
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and any(kw in model_lower for kw in spec.keywords):
-                if spec.is_oauth or p.api_key:
+                if spec.is_oauth or p.api_key or (spec.is_direct and p.api_base):
                     return p, spec.name
 
         # Fallback: gateways first, then others (follows registry order)
@@ -301,7 +302,7 @@ class Config(BaseSettings):
             if spec.is_oauth:
                 continue
             p = getattr(self.providers, spec.name, None)
-            if p and p.api_key:
+            if p and (p.api_key or (spec.is_direct and p.api_base)):
                 return p, spec.name
         return None, None
 

@@ -2,14 +2,12 @@
 
 import asyncio
 import re
-from typing import Any
 
 from loguru import logger
-from slack_sdk.socket_mode.websockets import SocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
+from slack_sdk.socket_mode.websockets import SocketModeClient
 from slack_sdk.web.async_client import AsyncWebClient
-
 from slackify_markdown import slackify_markdown
 
 from nanobot.bus.events import OutboundMessage
@@ -80,7 +78,7 @@ class SlackChannel(BaseChannel):
             return
         try:
             slack_meta = msg.metadata.get("slack", {}) if msg.metadata else {}
-            thread_ts = slack_meta.get("thread_ts")
+            thread_ts = msg.thread_id or slack_meta.get("thread_ts")
             channel_type = slack_meta.get("channel_type")
             # Only reply in thread for channel/group messages; DMs don't use threads
             use_thread = thread_ts and channel_type != "im"
@@ -170,6 +168,7 @@ class SlackChannel(BaseChannel):
             sender_id=sender_id,
             chat_id=chat_id,
             content=text,
+            thread_id=thread_ts,
             metadata={
                 "slack": {
                     "event": event,
@@ -234,4 +233,3 @@ class SlackChannel(BaseChannel):
             if parts:
                 rows.append(" · ".join(parts))
         return "\n".join(rows)
-

@@ -8,30 +8,36 @@ from typing import Any
 @dataclass
 class InboundMessage:
     """Message received from a chat channel."""
-    
+
     channel: str  # telegram, discord, slack, whatsapp
     sender_id: str  # User identifier
     chat_id: str  # Chat/channel identifier
     content: str  # Message text
     timestamp: datetime = field(default_factory=datetime.now)
     media: list[str] = field(default_factory=list)  # Media URLs
+    reply_to: str | None = None
+    thread_id: str | None = None
+    turn_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
-    
+
     @property
     def session_key(self) -> str:
         """Unique key for session identification."""
-        return f"{self.channel}:{self.chat_id}"
+        key = f"{self.channel}:{self.chat_id}"
+        if self.thread_id:
+            return f"{key}#{self.thread_id}"
+        return key
 
 
 @dataclass
 class OutboundMessage:
     """Message to send to a chat channel."""
-    
+
     channel: str
     chat_id: str
     content: str
     reply_to: str | None = None
+    thread_id: str | None = None
     media: list[str] = field(default_factory=list)
+    turn_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-
-

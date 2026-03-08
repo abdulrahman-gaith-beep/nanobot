@@ -1,29 +1,38 @@
 """Agent loop: the core processing engine."""
 
-import asyncio
-from contextlib import AsyncExitStack
-import json
-import json_repair
-from pathlib import Path
-import re
-from typing import Any, Awaitable, Callable
+from __future__ import annotations
 
+import asyncio
+import json
+import re
+from contextlib import AsyncExitStack
+from pathlib import Path
+from typing import TYPE_CHECKING, Awaitable, Callable
+
+import json_repair
 from loguru import logger
 
+from nanobot.agent.context import ContextBuilder
+from nanobot.agent.memory import MemoryStore
+from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
-from nanobot.agent.context import ContextBuilder
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
-from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.memory import MemoryStore
-from nanobot.agent.subagent import SubagentManager
+from nanobot.runtime.router import ChannelRouter
+from nanobot.runtime.tool_context import ToolExecutionContext, bind_tool_context
+from nanobot.runtime.turns import ReplyTarget, TurnRequest, TurnResult
 from nanobot.session.manager import Session, SessionManager
+
+if TYPE_CHECKING:
+    from nanobot.config.schema import ExecToolConfig
+    from nanobot.cron.service import CronService
 
 
 class AgentLoop:
@@ -49,14 +58,13 @@ class AgentLoop:
         max_tokens: int = 4096,
         memory_window: int = 50,
         brave_api_key: str | None = None,
-        exec_config: "ExecToolConfig | None" = None,
-        cron_service: "CronService | None" = None,
+        exec_config: ExecToolConfig | None = None,
+        cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
-        from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
@@ -71,6 +79,7 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
 
         self.context = ContextBuilder(workspace)
+        self.router = ChannelRouter()
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -84,13 +93,13 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
-        
+
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._register_default_tools()
-    
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         # File tools (restrict to workspace if configured)
@@ -99,30 +108,30 @@ class AgentLoop:
         self.tools.register(WriteFileTool(allowed_dir=allowed_dir))
         self.tools.register(EditFileTool(allowed_dir=allowed_dir))
         self.tools.register(ListDirTool(allowed_dir=allowed_dir))
-        
+
         # Shell tool
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
             timeout=self.exec_config.timeout,
             restrict_to_workspace=self.restrict_to_workspace,
         ))
-        
+
         # Web tools
         self.tools.register(WebSearchTool(api_key=self.brave_api_key))
         self.tools.register(WebFetchTool())
-        
+
         # Message tool
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)
         self.tools.register(message_tool)
-        
+
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
-        
+
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
-    
+
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
         if self._mcp_connected or not self._mcp_servers:
@@ -133,19 +142,15 @@ class AgentLoop:
         await self._mcp_stack.__aenter__()
         await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
 
-    def _set_tool_context(self, channel: str, chat_id: str) -> None:
-        """Update context for all tools that need routing info."""
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.set_context(channel, chat_id)
-
-        if spawn_tool := self.tools.get("spawn"):
-            if isinstance(spawn_tool, SpawnTool):
-                spawn_tool.set_context(channel, chat_id)
-
-        if cron_tool := self.tools.get("cron"):
-            if isinstance(cron_tool, CronTool):
-                cron_tool.set_context(channel, chat_id)
+    @staticmethod
+    def _build_tool_context(turn: TurnRequest) -> ToolExecutionContext:
+        """Create the immutable, request-scoped tool context for a turn."""
+        return ToolExecutionContext(
+            turn_id=turn.turn_id,
+            session_key=turn.resolved_session_key,
+            kind=turn.kind,
+            reply_target=turn.reply_target,
+        )
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -251,11 +256,15 @@ class AgentLoop:
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}"
+                        content=f"Sorry, I encountered an error: {str(e)}",
+                        reply_to=msg.reply_to,
+                        thread_id=msg.thread_id,
+                        metadata=msg.metadata or {},
+                        turn_id=msg.turn_id,
                     ))
             except asyncio.TimeoutError:
                 continue
-    
+
     async def close_mcp(self) -> None:
         """Close MCP connections."""
         if self._mcp_stack:
@@ -269,7 +278,7 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
-    
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -278,27 +287,28 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """
         Process a single inbound message.
-        
+
         Args:
             msg: The inbound message to process.
             session_key: Override session key (used by process_direct).
             on_progress: Optional callback for intermediate output (defaults to bus publish).
-        
+
         Returns:
             The response message, or None if no response needed.
         """
         # System messages route back via chat_id ("channel:chat_id")
         if msg.channel == "system":
             return await self._process_system_message(msg)
-        
+
+        turn = self.router.inbound_to_turn(msg, session_key=session_key)
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
-        
-        key = session_key or msg.session_key
+
+        key = turn.resolved_session_key
         session = self.sessions.get_or_create(key)
-        
+
         # Handle slash commands
-        cmd = msg.content.strip().lower()
+        cmd = turn.content.strip().lower()
         if cmd == "/new":
             # Capture messages before clearing (avoid race condition with background task)
             messages_to_archive = session.messages.copy()
@@ -312,61 +322,64 @@ class AgentLoop:
                 await self._consolidate_memory(temp_session, archive_all=True)
 
             asyncio.create_task(_consolidate_and_cleanup())
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started. Memory consolidation in progress.")
+            return self.router.result_to_outbound(TurnResult(
+                content="New session started. Memory consolidation in progress.",
+                reply_target=turn.reply_target,
+                turn_id=turn.turn_id,
+            ))
         if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
-        
+            return self.router.result_to_outbound(TurnResult(
+                content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands",
+                reply_target=turn.reply_target,
+                turn_id=turn.turn_id,
+            ))
+
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
 
-        self._set_tool_context(msg.channel, msg.chat_id)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
+            current_message=turn.content,
+            media=list(turn.media) if turn.media else None,
+            channel=turn.reply_target.channel,
+            chat_id=turn.reply_target.chat_id,
         )
 
         async def _bus_progress(content: str) -> None:
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content,
-                metadata=msg.metadata or {},
-            ))
+            await self.bus.publish_outbound(self.router.progress_to_outbound(content, turn))
 
-        final_content, tools_used = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
-        )
+        with bind_tool_context(self._build_tool_context(turn)):
+            final_content, tools_used = await self._run_agent_loop(
+                initial_messages, on_progress=on_progress or _bus_progress,
+            )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
-        
+
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
-        
-        session.add_message("user", msg.content)
+
+        session.add_message("user", turn.content)
         session.add_message("assistant", final_content,
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
-        
-        return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
+
+        return self.router.result_to_outbound(TurnResult(
             content=final_content,
-            metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
-        )
-    
+            reply_target=turn.reply_target,
+            turn_id=turn.turn_id,
+            tools_used=tuple(tools_used),
+        ))
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
-        
+
         The chat_id field contains "original_channel:original_chat_id" to route
         the response back to the correct destination.
         """
         logger.info(f"Processing system message from {msg.sender_id}")
-        
+
         # Parse origin from chat_id (format: "channel:chat_id")
         if ":" in msg.chat_id:
             parts = msg.chat_id.split(":", 1)
@@ -376,31 +389,39 @@ class AgentLoop:
             # Fallback
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
-        
-        session_key = f"{origin_channel}:{origin_chat_id}"
+
+        turn = TurnRequest(
+            content=msg.content,
+            reply_target=ReplyTarget(channel=origin_channel, chat_id=origin_chat_id),
+            sender_id=msg.sender_id,
+            session_key=f"{origin_channel}:{origin_chat_id}",
+            kind="system",
+            turn_id=msg.turn_id or msg.session_key.replace(":", "_"),
+        )
+        session_key = turn.resolved_session_key
         session = self.sessions.get_or_create(session_key)
-        self._set_tool_context(origin_channel, origin_chat_id)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
-            current_message=msg.content,
-            channel=origin_channel,
-            chat_id=origin_chat_id,
+            current_message=turn.content,
+            channel=turn.reply_target.channel,
+            chat_id=turn.reply_target.chat_id,
         )
-        final_content, _ = await self._run_agent_loop(initial_messages)
+        with bind_tool_context(self._build_tool_context(turn)):
+            final_content, _ = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "Background task completed."
-        
+
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
         self.sessions.save(session)
-        
-        return OutboundMessage(
-            channel=origin_channel,
-            chat_id=origin_chat_id,
-            content=final_content
-        )
-    
+
+        return self.router.result_to_outbound(TurnResult(
+            content=final_content,
+            reply_target=turn.reply_target,
+            turn_id=turn.turn_id,
+        ))
+
     async def _consolidate_memory(self, session, archive_all: bool = False) -> None:
         """Consolidate old messages into MEMORY.md + HISTORY.md.
 
@@ -496,14 +517,14 @@ Respond with ONLY valid JSON, no markdown fences."""
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
-        
+
         Args:
             content: The message content.
             session_key: Session identifier (overrides channel:chat_id for session lookup).
             channel: Source channel (for tool context routing).
             chat_id: Source chat ID (for tool context routing).
             on_progress: Optional callback for intermediate output.
-        
+
         Returns:
             The agent's response.
         """
@@ -514,6 +535,6 @@ Respond with ONLY valid JSON, no markdown fences."""
             chat_id=chat_id,
             content=content
         )
-        
+
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""
