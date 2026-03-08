@@ -14,7 +14,6 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import DiscordConfig
 
-
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
 
@@ -231,10 +230,10 @@ class DiscordChannel(BaseChannel):
             chat_id=channel_id,
             content="\n".join(p for p in content_parts if p) or "[empty message]",
             media=media_paths,
+            reply_to=str(reply_to) if reply_to else None,
             metadata={
                 "message_id": str(payload.get("id", "")),
                 "guild_id": payload.get("guild_id"),
-                "reply_to": reply_to,
             },
         )
 
